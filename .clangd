@@ -1,6 +1,0 @@
-
-CompileFlags:
-  Add:
-    - --cuda-path=/opt/cuda/
-    - -LC: /opt/cuda/lib
-    - -IC:/opt/cuda/include
