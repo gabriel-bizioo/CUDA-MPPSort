@@ -1,6 +1,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_runtime_api.h>
 #include <driver_types.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,20 +11,16 @@
 #include <thrust/device_ptr.h>
 
 #define MAX_SIZE INT_MAX
-#define SHARED_SIZE_LIMIT 32
-#define DEBUG
+#define SHARED_SIZE_LIMIT 1024
 
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
-inline cudaError_t checkCuda(cudaError_t result, const char debugstr[256]) {
-#ifdef DEBUG
+inline void checkCuda(cudaError_t result, const char debugstr[256]) {
     if(result != cudaSuccess) {
         fprintf(stderr, "CUDA Runtime Error: %s (%s)\n", cudaGetErrorString(result), debugstr);
         assert(result == cudaSuccess);
     }
-    return result;
-#endif
 }
 
 inline void printDeviceArray(unsigned int *d_Array, int nElements, const char debugstr[256]) {
@@ -35,6 +32,7 @@ inline void printDeviceArray(unsigned int *d_Array, int nElements, const char de
     for(int i = 0; i < nElements; i++)
         printf("%u ", h_Array[i]);
     printf("\n\n");
+    free(h_Array);
 #endif
 }
 
@@ -52,14 +50,13 @@ blockAndGlobalHistogram(unsigned int *HH, unsigned int *Hg, int h, unsigned int 
         unsigned int nElements, unsigned int minV, unsigned int maxV) {
     extern __shared__ unsigned int histogram[];
 
-    if(threadIdx.x < h) {
+    if(threadIdx.x < h)
         histogram[threadIdx.x] = 0;
-    }
     __syncthreads();
 
     unsigned int partition_size = (maxV - minV + 1) / h;
     if(partition_size == 0) partition_size = 1;
-    
+
     int total_active_threads = blockDim.x * gridDim.x;
     for(int i = blockDim.x * blockIdx.x + threadIdx.x; i < nElements; i += total_active_threads) {
         unsigned int val = Input[i];
@@ -70,9 +67,10 @@ blockAndGlobalHistogram(unsigned int *HH, unsigned int *Hg, int h, unsigned int 
     __syncthreads();
 
     if(threadIdx.x < h) {
-        atomicAdd(&Hg[threadIdx.x], histogram[threadIdx.x]);
         HH[blockIdx.x * h + threadIdx.x] = histogram[threadIdx.x];
+        atomicAdd(&Hg[threadIdx.x], histogram[threadIdx.x]);
     }
+
 }
 
 __global__ void
@@ -97,28 +95,28 @@ globalHistogramScan(unsigned int *Hg, unsigned int *SHg, int h) {
     }
 }
 
-__global__ void verticalScanHH(unsigned int *HH, unsigned int *PSv, int h) {
+__global__ void 
+verticalScanHH(unsigned int *HH, unsigned int *PSv, int h) {
     if (threadIdx.x < h) {
-        int index = blockIdx.x * h + threadIdx.x;
+        unsigned int index = blockIdx.x * h + threadIdx.x;
 
         unsigned int sum = 0;
         for (int i = 0; i < blockIdx.x; i++) {
             int hhIndex = i * h + threadIdx.x;
             sum += HH[hhIndex];
         }
+
         PSv[index] = sum;
     }
 }
 
 __global__ void
-partitionKernel(unsigned int *HH, unsigned int *SHg, unsigned int *PSv, int h, 
-                unsigned int *Input, unsigned int *Output,
-                int nElements, unsigned int minV, unsigned int maxV) {
+partitionKernel(unsigned int *SHg, unsigned int *PSv, int h, unsigned int *Input,
+                unsigned int *Output, int nElements, unsigned int minV, unsigned int maxV) {
     extern __shared__ unsigned int HLsh[];
 
-    if(threadIdx.x < h) {
+    if(threadIdx.x < h)
         HLsh[threadIdx.x] = PSv[blockIdx.x * h + threadIdx.x] + SHg[threadIdx.x];
-    }
     __syncthreads();
 
     unsigned int partition_size = (maxV - minV + 1) / h;
@@ -127,13 +125,14 @@ partitionKernel(unsigned int *HH, unsigned int *SHg, unsigned int *PSv, int h,
     int total_active_threads = blockDim.x * gridDim.x;
     for(int i = blockDim.x * blockIdx.x + threadIdx.x; i < nElements; i += total_active_threads) {
         unsigned int e = Input[i];
-        int f = (e - minV) / partition_size;
-        if(f >= h) f = h - 1;
+        unsigned int f = (e - minV) / partition_size;
+        if(f == h) f = h - 1;
 
         unsigned int p = atomicAdd(&HLsh[f], 1);
         Output[p] = e;
     }
 }
+
 __device__ __host__ __forceinline__
 unsigned int nextPowerOf2_portable(unsigned int n) {
     if (n == 0) return 1;
@@ -158,77 +157,63 @@ __global__ void bitonicSortShared(uint *d_SrcKey, uint nElements, unsigned int h
     __shared__ uint s_key[SHARED_SIZE_LIMIT];
 
     //Define a particao na qual o bloco vai trabalhar
-    int blockStart, blockEnd;
-    int blockSharedMemLimit;
+    int blockStart, partitionSize;
+    int blockSizeWithPadding;
+    for(int i = blockIdx.x; i < h; i += gridDim.x) {
+        if(Hg[i] > SHARED_SIZE_LIMIT)
+            continue;
+        blockStart = SHg[i];
+        // Para ordenar corretamente particoes de tamanho nao multiplo de 2
+        blockSizeWithPadding = nextPowerOf2_portable(Hg[i]);
+        partitionSize = Hg[i];
 
-    //This would probably work better if done in an outside
-    //function and passed as data somehow
-    if(threadIdx.x == 0) {
-        // Descobre quantos blocos cada particao precisa
-        int acc = 0;
-        int blockIndexOffset = 0;
-        for(int i = 0; i < h; i++) {
-            acc += ceilDiv(Hg[i], SHARED_SIZE_LIMIT);
-            if(blockIdx.x < acc) {
-                blockStart = SHg[i] + (blockIdx.x - blockIndexOffset) * SHARED_SIZE_LIMIT;
-                if(blockStart + Hg[i] < SHARED_SIZE_LIMIT) {
-                    blockEnd = blockStart + Hg[i];
-                    blockSharedMemLimit = nextPowerOf2_portable(Hg[i]);
-                }
-                else {
-                    blockEnd = blockStart + SHARED_SIZE_LIMIT;
-                    blockSharedMemLimit = SHARED_SIZE_LIMIT; // Already a power of 2
-                }
-                break;
-            }
+        // move ponteiro pro comeco da particao
+        d_SrcKey += blockStart;
+        if(threadIdx.x >= blockSizeWithPadding / 2)
+            continue;
+        int index = threadIdx.x + blockSizeWithPadding / 2;
+        if(index >= partitionSize) {
 
-            blockIndexOffset = acc;
+            if(dir)
+                s_key[index] = UINT_MAX;
+            else
+                s_key[index] = 0;
         }
-        if(blockIdx.x >= acc)
-            return;
-     }
+        else {
+            s_key[index] =
+                d_SrcKey[(blockSizeWithPadding / 2) + threadIdx.x];
+        }
 
-    // Padding
-    if(threadIdx.x >= (blockEnd - blockStart) && threadIdx.x < blockSharedMemLimit) {
-        if(dir)
-            s_key[threadIdx.x] = UINT_MAX;
-        else
-            s_key[threadIdx.x] = 0;
+        s_key[threadIdx.x] = d_SrcKey[threadIdx.x];
+
+        cg::sync(cta);
+
+        for (uint size = 2; size < blockSizeWithPadding; size <<= 1) {
+            // Bitonic merge
+            uint ddd = dir ^ ((threadIdx.x & (size / 2)) != 0);
+
+            for (uint stride = size / 2; stride > 0; stride >>= 1) {
+                cg::sync(cta);
+                uint pos = 2 * threadIdx.x - (threadIdx.x & (stride - 1));
+                Comparator(s_key[pos + 0], s_key[pos + stride], ddd);
+            }
+        }
+
+        // ddd == dir for the last bitonic merge step
+        {
+            for (uint stride = (blockSizeWithPadding)/ 2; stride > 0; stride >>= 1) {
+                cg::sync(cta);
+                uint pos = 2 * threadIdx.x - (threadIdx.x & (stride - 1));
+                Comparator(s_key[pos + 0], s_key[pos + stride], dir);
+            }
+        }
+
+        cg::sync(cta);
+        d_SrcKey[threadIdx.x] = s_key[threadIdx.x + 0];
+        if(index < partitionSize)
+            d_SrcKey[threadIdx.x + (blockSizeWithPadding/ 2)] =
+                s_key[threadIdx.x + (blockSizeWithPadding/ 2)];
     }
-
-     if(threadIdx.x >= blockSharedMemLimit / 2)
-         return;
-     // Offset to the beginning of subbatch and load data
-     d_SrcKey += blockStart + threadIdx.x;
-     s_key[threadIdx.x + 0] = d_SrcKey[0];
-     s_key[threadIdx.x + (blockSharedMemLimit / 2)] =
-         d_SrcKey[(blockSharedMemLimit / 2)];
-
-
-     for (uint size = 2; size < blockSharedMemLimit; size <<= 1) {
-         // Bitonic merge
-         uint ddd = dir ^ ((threadIdx.x & (size / 2)) != 0);
-
-         for (uint stride = size / 2; stride > 0; stride >>= 1) {
-             cg::sync(cta);
-             uint pos = 2 * threadIdx.x - (threadIdx.x & (stride - 1));
-             Comparator(s_key[pos + 0], s_key[pos + stride], ddd);
-         }
-     }
-
-     // ddd == dir for the last bitonic merge step
-     {
-         for (uint stride = (blockSharedMemLimit)/ 2; stride > 0; stride >>= 1) {
-             cg::sync(cta);
-             uint pos = 2 * threadIdx.x - (threadIdx.x & (stride - 1));
-             Comparator(s_key[pos + 0], s_key[pos + stride], dir);
-         }
-     }
-
-     cg::sync(cta);
-     d_SrcKey[0] = s_key[threadIdx.x + 0];
-     d_SrcKey[(blockSharedMemLimit/ 2)] =
-         s_key[threadIdx.x + (blockSharedMemLimit/ 2)];
 }
 
 bool verifySort(unsigned int *thrustOutput, unsigned int *Output_d, int nElements) {
@@ -236,12 +221,28 @@ bool verifySort(unsigned int *thrustOutput, unsigned int *Output_d, int nElement
     for(int i = 0; i < nElements; i++) {
         if(thrustOutput[i] != Output_d[i]) {
             result = false;
-            printf("Mismatch at position %d: %u != %u\n", i, thrustOutput[i], Output_d[i]);
             break;
         }
     }
 
     return result;
+}
+
+void buildPSvCPU(const unsigned int *HH, unsigned int *PSv,
+                 int B, int h)
+{
+    // HH e PSv têm tamanho B*h, indexação row-major:
+    // linha = bloco (b), coluna = partição (j)
+    // idx(b,j) = b*h + j
+
+    for (int j = 0; j < h; ++j) {          // fixa partição (coluna)
+        unsigned int acc = 0;
+        for (int b = 0; b < B; ++b) {      // varre blocos (linhas)
+            int idx = b * h + j;
+            PSv[idx] = acc;
+            acc += HH[idx];
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -292,18 +293,10 @@ int main(int argc, char *argv[]) {
     unsigned int *HH, *Hg, *SHg, *PSv;
 
     int nb;
-    int nt;
-
     if(h >= 16)
         nb = 16;
     else
         nb = h;
-
-    if(h >= 1024) {
-        printf("Tamanho maximo de h eh 1024\n");
-        exit(1);
-    }
-    nt = h;
 
     checkCuda(cudaMalloc(&Input_d, sizeof(unsigned int) * nTotalElements), "Line 277\n");
     checkCuda(cudaMalloc(&Output_d, sizeof(unsigned int) * nTotalElements), "line 278\n");
@@ -334,18 +327,18 @@ int main(int argc, char *argv[]) {
     cudaEventCreate(&total_start);
     cudaEventCreate(&total_stop);
 
+    int nt;
+    if(h > 1024)
+        nt = 1024;
+    else
+        nt = h;
+
     // Warmup
     checkCuda(cudaMemset(HH, 0, sizeof(unsigned int) * nb * h), "Line 307");
     checkCuda(cudaMemset(Hg, 0, sizeof(unsigned int) * h), "Line 308");
     blockAndGlobalHistogram<<<nb, nt, sizeof(unsigned int) * h>>>(HH, Hg, h, Input_d, nTotalElements, minV, maxV);
     cudaDeviceSynchronize();
-
-    int maxBlocks = 1024;
-    int numBlocks;
-    if(h < maxBlocks)
-        numBlocks = h;
-    else
-        numBlocks = maxBlocks;
+    unsigned int thrustQueue[h];
 
     float k1_time, k2_time, k3_time, k4_time, k5_time, total_time;
     k1_time = k2_time = k3_time = k4_time = k5_time = 0.0f;
@@ -356,68 +349,54 @@ int main(int argc, char *argv[]) {
         checkCuda(cudaMemset(Hg, 0, sizeof(unsigned int) * h), "Line 326");
         checkCuda(cudaMemset(PSv, 0, sizeof(unsigned int) * nb * h), "line 327");
 
-        printDeviceArray(Input_d, nTotalElements, "Input inicio");
         cudaEventRecord(k1_start);
-        blockAndGlobalHistogram<<<nb, nt, sizeof(unsigned int) * h>>>(HH, Hg, h, Input_d, nTotalElements, minV, maxV);
+        blockAndGlobalHistogram<<<nb, 1024, sizeof(unsigned int) * h>>>(HH, Hg, h, Input_d, nTotalElements, minV, maxV);
+        cudaEventRecord(k1_stop);
         if (err != cudaSuccess) {
             err = cudaDeviceSynchronize();
             printf("Kernel failed: %s (blockAndGlobalHistogram)\n", cudaGetErrorString(err));
             return 1;
         }
-        cudaEventRecord(k1_stop);
-        printDeviceArray(HH, nb*h, "HH blockAndGlobalHistogram");
-        printDeviceArray(Hg, h, "Hg blockAndGlobalHistogram");
 
         cudaEventRecord(k2_start);
-        globalHistogramScan<<<1, nt, sizeof(unsigned int) * (h + 1)>>>(Hg, SHg, h);
+        globalHistogramScan<<<1, h, sizeof(unsigned int) * (h + 1)>>>(Hg, SHg, h);
+        cudaEventRecord(k2_stop);
         if (err != cudaSuccess) {
             err = cudaDeviceSynchronize();
             printf("Kernel failed: %s (globalHistogramScan)\n", cudaGetErrorString(err));
             return 1;
         }
-        cudaEventRecord(k2_stop);
-        printDeviceArray(Hg, h, "Hg globalHistogramScan");
-        printDeviceArray(SHg, h, "SHg globalHistogramScan");
 
         cudaEventRecord(k3_start);
-        verticalScanHH<<<nb, nt>>>(HH, PSv, h);
+        verticalScanHH<<<nb, h>>>(HH, PSv, h);
         cudaEventRecord(k3_stop);
         err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             printf("Kernel failed: %s (verticalScanHH)\n", cudaGetErrorString(err));
             return 1;
         }
-        printDeviceArray(HH, nb*h, "HH verticalScanHH");
-        printDeviceArray(PSv, nb*h, "PSv verticalScanHH");
-
 
         cudaEventRecord(k4_start);
-        partitionKernel<<<nb, nt, sizeof(unsigned int) * h>>>(HH, SHg, PSv, h, Input_d, Output_d, nTotalElements, minV, maxV);
+        partitionKernel<<<nb, 1024, sizeof(unsigned int) * h>>>(SHg, PSv, h, Input_d, Output_d, nTotalElements, minV, maxV);
         cudaEventRecord(k4_stop);
         err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             printf("Kernel failed: %s (partitionKernel)\n", cudaGetErrorString(err));
             return 1;
         }
-        printDeviceArray(Output_d, nTotalElements, "Output_d partitionKernel");
 
         cudaEventRecord(k5_start);
-        bitonicSortShared<<<nb, 512>>>(Output_d, nTotalElements, h, Hg, SHg, 0);
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            printf("Kernel failed: %s (partitionBitonicSortShared)\n", cudaGetErrorString(err));
-            return 1;
+        checkCuda(cudaMemcpy(thrustQueue, Hg, sizeof(unsigned int) * h, cudaMemcpyDeviceToHost), "Thrust queue");
+        bitonicSortShared<<<nb, 512>>>(Output_d, nTotalElements, h, Hg, SHg, 1);
+        for(int i = 0; i < h; i++) {
+            if(thrustQueue[i] > SHARED_SIZE_LIMIT)
+                thrust::sort(thrust::device, Output_d, Output_d + thrustQueue[i]);
         }
-        printDeviceArray(Output_d, nTotalElements, "Output_d bitonicSortShared");
-        //partitionBitonicMergeGlobal<<<numBlocks, nt>>>(Output_d, SHg, Hg, h, 0);
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            printf("Kernel failed: %s (partitionBitonicMergeGlobal)\n", cudaGetErrorString(err));
-            return 1;
-        }
-        printDeviceArray(Output_d, nTotalElements, "Output_d bitonicMergeGlobal");
         cudaEventRecord(k5_stop);
-
+        if (err != cudaSuccess) {
+            printf("Kernel failed: %s (bitonicSortShared)\n", cudaGetErrorString(err));
+            return 1;
+        }
 
         cudaEventElapsedTime(&k1_temp, k1_start, k1_stop);
         cudaEventElapsedTime(&k2_temp, k2_start, k2_stop);
