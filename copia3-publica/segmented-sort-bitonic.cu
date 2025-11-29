@@ -95,13 +95,24 @@ __global__ void blockBitonicSort(   //   bitonicSortShared
 
     uint pad_value = dir ? UINT_MAX : 0;  // Pad with max for ascending, min for descending
 
-    uint tid = threadIdx.x;
-    // Load data into shared memory with padding (looped over threads)
-    if(tid < arrayLength)
-        s_key[tid] = d_SrcKey[offset + tid];
-    else if(tid < padded_size)
-        s_key[tid] = pad_value;
 
+    uint tid = threadIdx.x;
+    int elements_per_thread = padded_size / blockDim.x;
+    elements_per_thread += (padded_size % blockDim.x) ? 1 : 0;
+    if (tid == 0)
+        printf("Sorting segment %d (offset %d, size %d, padded %d, number of threads %d)\n",
+                seg_idx, offset, arrayLength, padded_size, blockDim.x);
+
+
+    // Load data into shared memory with padding (looped over threads)
+    for(uint i = threadIdx.x; i < padded_size; i += blockDim.x) {
+        if(i < arrayLength)
+            s_key[i] = d_SrcKey[offset + i];
+        else
+            s_key[i] = pad_value;
+    }
+
+    __syncthreads();
     // Bitonic sort on padded size
     for (uint size = 2; size < padded_size; size <<= 1) {
         // Bitonic merge
@@ -111,23 +122,26 @@ __global__ void blockBitonicSort(   //   bitonicSortShared
         //lg(size) iteracoes
         for (uint stride = size / 2; stride > 0; stride >>= 1) {
             __syncthreads();
-            uint pos = 2 * tid - (tid & (stride - 1));
-            Comparator(s_key[pos], s_key[pos + stride], ddd);
+            if(tid < arrayLength) {
+                uint pos = 2 * tid - (tid & (stride - 1));
+                Comparator(s_key[pos], s_key[pos + stride], ddd);
+            }
         }
     }
 
     // Final bitonic merge step with ddd = dir
     for(uint stride = (padded_size)/2; stride < 0; stride >>= 1) {
         __syncthreads();
-        uint pos = 2 * tid - (tid & (stride - 1));
-        Comparator(s_key[pos], s_key[pos + stride], dir);
-
+        if(tid < arrayLength) {
+            uint pos = 2 * tid - (tid & (stride - 1));
+            Comparator(s_key[pos], s_key[pos + stride], dir);
+        }
     }
 
-
-    // Write back only the original segment (without pads)
-    if(tid < arrayLength)
-        d_DstKey[offset + tid] = s_key[tid];
+    for(tid; tid < arrayLength; tid += blockDim.x) {
+        if(tid < arrayLength)
+            d_DstKey[offset + tid] = s_key[tid];
+    }
 }
 
 
