@@ -1,2 +1,6 @@
 mppSort:
-	nvcc -ccbin clang++ main.cu -o mppSort -arch=sm_50
+	./compila.sh
+clean:
+	rm mpp-sort-bitonic-256
+	rm mpp-sort-bitonic-512
+	rm mpp-sort-bitonic-1024

@@ -1,4 +1,5 @@
 #include <climits>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
@@ -11,10 +12,8 @@
 #include <thrust/device_ptr.h>
 
 #define MAX_SIZE INT_MAX
-#define SHARED_SIZE_LIMIT 1024
+#define SHM_LIMIT 4096
 
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
 
 inline void checkCuda(cudaError_t result, const char debugstr[256]) {
     if(result != cudaSuccess) {
@@ -150,70 +149,65 @@ unsigned int ceilDiv(unsigned int a, unsigned int b) {
     return (a + b - 1) / b;
 }
 
-__global__ void bitonicSortShared(uint *d_SrcKey, uint nElements, unsigned int h, unsigned int *Hg, unsigned int *SHg, uint dir) {
-    // Handle to thread block group
-    cg::thread_block cta = cg::this_thread_block();
+__global__ void blockBitonicSort(
+    uint *d_DstKey,
+    uint *d_SrcKey,
+    uint *d_Offsets,
+    uint *d_Sizes,
+    uint dir
+) {
     // Shared memory storage for one or more short vectors
-    __shared__ uint s_key[SHARED_SIZE_LIMIT];
+    extern __shared__ uint s_key[];
 
     //Define a particao na qual o bloco vai trabalhar
-    int blockStart, partitionSize;
-    int blockSizeWithPadding;
-    for(int i = blockIdx.x; i < h; i += gridDim.x) {
-        if(Hg[i] > SHARED_SIZE_LIMIT)
-            continue;
-        blockStart = SHg[i];
-        // Para ordenar corretamente particoes de tamanho nao multiplo de 2
-        blockSizeWithPadding = nextPowerOf2_portable(Hg[i]);
-        partitionSize = Hg[i];
+    uint seg_idx = blockIdx.x;
+    uint offset = d_Offsets[seg_idx];
+    uint arrayLength = d_Sizes[seg_idx];
+    if (arrayLength == 0) return;
 
-        // move ponteiro pro comeco da particao
-        d_SrcKey += blockStart;
-        if(threadIdx.x >= blockSizeWithPadding / 2)
-            continue;
-        int index = threadIdx.x + blockSizeWithPadding / 2;
-        if(index >= partitionSize) {
+    // Compute padded size (next power of 2 >= arrayLength)
+    uint padded_size = (arrayLength == 1) ? 1 : (1 << (32 - __clz(arrayLength - 1)));
+    uint pad_value = dir ?  UINT_MAX : 0;
+    uint tid = threadIdx.x;
 
-            if(dir)
-                s_key[index] = UINT_MAX;
-            else
-                s_key[index] = 0;
-        }
-        else {
-            s_key[index] =
-                d_SrcKey[(blockSizeWithPadding / 2) + threadIdx.x];
-        }
-
-        s_key[threadIdx.x] = d_SrcKey[threadIdx.x];
-
-        cg::sync(cta);
-
-        for (uint size = 2; size < blockSizeWithPadding; size <<= 1) {
-            // Bitonic merge
-            uint ddd = dir ^ ((threadIdx.x & (size / 2)) != 0);
-
-            for (uint stride = size / 2; stride > 0; stride >>= 1) {
-                cg::sync(cta);
-                uint pos = 2 * threadIdx.x - (threadIdx.x & (stride - 1));
-                Comparator(s_key[pos + 0], s_key[pos + stride], ddd);
-            }
-        }
-
-        // ddd == dir for the last bitonic merge step
-        {
-            for (uint stride = (blockSizeWithPadding)/ 2; stride > 0; stride >>= 1) {
-                cg::sync(cta);
-                uint pos = 2 * threadIdx.x - (threadIdx.x & (stride - 1));
-                Comparator(s_key[pos + 0], s_key[pos + stride], dir);
-            }
-        }
-
-        cg::sync(cta);
-        d_SrcKey[threadIdx.x] = s_key[threadIdx.x + 0];
-        if(index < partitionSize)
-            d_SrcKey[threadIdx.x + (blockSizeWithPadding/ 2)] =
-                s_key[threadIdx.x + (blockSizeWithPadding/ 2)];
+    for(uint i = tid; i < padded_size; i += blockDim.x) {
+        if(i < arrayLength)
+            s_key[i] = d_SrcKey[offset + i];
+        else
+            s_key[i] = pad_value;
     }
+
+    uint pairs_per_thread = (padded_size / 2) / blockDim.x;
+    pairs_per_thread += ((padded_size / 2) % blockDim.x) ? 1 : 0;
+    uint thread_pairs = tid * pairs_per_thread;
+    __syncthreads();
+    // Bitonic sort on padded size
+    for (uint size = 2; size < padded_size; size <<= 1) {
+        // Bitonic merge
+        for (uint stride = size / 2; stride > 0; stride >>= 1) {
+            __syncthreads();
+            for(uint i = 0; i < pairs_per_thread; i++) {
+                uint pid = thread_pairs + i;
+                uint ddd = dir ^((pid & (size / 2)) != 0);
+                uint pos = 2 * pid - (pid & (stride - 1));
+                Comparator(s_key[pos], s_key[pos + stride], ddd);
+            }
+        }
+    }
+
+    // ddd == dir for the last bitonic merge step
+    for (uint stride = padded_size/ 2; stride > 0; stride >>= 1) {
+        __syncthreads();
+        for(uint i = 0; i < pairs_per_thread; i++) {
+            uint pid = thread_pairs + i;
+            uint pos = 2 * pid - (pid & (stride - 1));
+            Comparator(s_key[pos], s_key[pos + stride], dir);
+        }
+    }
+
+    __syncthreads();
+    for(uint i = threadIdx.x; i < arrayLength; i += blockDim.x)
+        d_DstKey[offset + i] = s_key[i];
 }
 
 bool verifySort(unsigned int *thrustOutput, unsigned int *Output_d, int nElements) {
@@ -312,20 +306,21 @@ int main(int argc, char *argv[]) {
     cudaEvent_t k3_start, k3_stop;
     cudaEvent_t k4_start, k4_stop;
     cudaEvent_t k5_start, k5_stop;
-    cudaEvent_t total_start, total_stop;
 
     cudaEventCreate(&k1_start);
     cudaEventCreate(&k1_stop);
+
     cudaEventCreate(&k2_start);
     cudaEventCreate(&k2_stop);
+
     cudaEventCreate(&k3_start);
     cudaEventCreate(&k3_stop);
+
     cudaEventCreate(&k4_start);
     cudaEventCreate(&k4_stop);
+
     cudaEventCreate(&k5_start);
     cudaEventCreate(&k5_stop);
-    cudaEventCreate(&total_start);
-    cudaEventCreate(&total_stop);
 
     int nt;
     if(h > 1024)
@@ -336,7 +331,8 @@ int main(int argc, char *argv[]) {
     // Warmup
     checkCuda(cudaMemset(HH, 0, sizeof(unsigned int) * nb * h), "Line 307");
     checkCuda(cudaMemset(Hg, 0, sizeof(unsigned int) * h), "Line 308");
-    blockAndGlobalHistogram<<<nb, nt, sizeof(unsigned int) * h>>>(HH, Hg, h, Input_d, nTotalElements, minV, maxV);
+    blockAndGlobalHistogram<<<nb, nt, sizeof(unsigned int) * h>>>(HH, Hg, h, Input_d,
+            nTotalElements, minV, maxV);
     cudaDeviceSynchronize();
     unsigned int thrustQueue[h];
 
@@ -350,53 +346,81 @@ int main(int argc, char *argv[]) {
         checkCuda(cudaMemset(PSv, 0, sizeof(unsigned int) * nb * h), "line 327");
 
         cudaEventRecord(k1_start);
-        blockAndGlobalHistogram<<<nb, 1024, sizeof(unsigned int) * h>>>(HH, Hg, h, Input_d, nTotalElements, minV, maxV);
+        blockAndGlobalHistogram<<<nb, 1024, sizeof(unsigned int) * h>>>(HH, Hg, h,
+                Input_d, nTotalElements, minV, maxV);
         cudaEventRecord(k1_stop);
-        if (err != cudaSuccess) {
-            err = cudaDeviceSynchronize();
-            printf("Kernel failed: %s (blockAndGlobalHistogram)\n", cudaGetErrorString(err));
-            return 1;
-        }
+        #ifdef DEBUG
+            if (err != cudaSuccess) {
+                err = cudaDeviceSynchronize();
+                printf("Kernel failed: %s (blockAndGlobalHistogram)\n",
+                        cudaGetErrorString(err));
+                return 1;
+            }
+        #else
+            cudaEventSynchronize(k1_stop);
+        #endif
 
         cudaEventRecord(k2_start);
         globalHistogramScan<<<1, h, sizeof(unsigned int) * (h + 1)>>>(Hg, SHg, h);
         cudaEventRecord(k2_stop);
-        if (err != cudaSuccess) {
-            err = cudaDeviceSynchronize();
-            printf("Kernel failed: %s (globalHistogramScan)\n", cudaGetErrorString(err));
-            return 1;
-        }
+        #ifdef DEBUG
+            if (err != cudaSuccess) {
+                err = cudaDeviceSynchronize();
+                printf("Kernel failed: %s (globalHistogramScan)\n",
+                        cudaGetErrorString(err));
+                return 1;
+            }
+        #else
+            cudaEventSynchronize(k2_stop);
+        #endif
 
         cudaEventRecord(k3_start);
         verticalScanHH<<<nb, h>>>(HH, PSv, h);
         cudaEventRecord(k3_stop);
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            printf("Kernel failed: %s (verticalScanHH)\n", cudaGetErrorString(err));
-            return 1;
-        }
+        #ifdef DEBUG
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                printf("Kernel failed: %s (verticalScanHH)\n",
+                        cudaGetErrorString(err));
+                return 1;
+            }
+        #else
+            cudaEventSynchronize(k3_stop);
+        #endif
 
         cudaEventRecord(k4_start);
         partitionKernel<<<nb, 1024, sizeof(unsigned int) * h>>>(SHg, PSv, h, Input_d, Output_d, nTotalElements, minV, maxV);
         cudaEventRecord(k4_stop);
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            printf("Kernel failed: %s (partitionKernel)\n", cudaGetErrorString(err));
-            return 1;
-        }
+        #ifdef DEBUG
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                printf("Kernel failed: %s (partitionKernel)\n",
+                        cudaGetErrorString(err));
+                return 1;
+            }
+        #else
+            cudaEventSynchronize(k4_stop);
+        #endif
 
         cudaEventRecord(k5_start);
+        size_t shared_bytes = SHM_LIMIT * sizeof(uint);
+        blockBitonicSort<<<h, THREADS_PER_BLOCK, shared_bytes>>>(Output_d, Output_d, SHg, Hg, 1);
         checkCuda(cudaMemcpy(thrustQueue, Hg, sizeof(unsigned int) * h, cudaMemcpyDeviceToHost), "Thrust queue");
-        bitonicSortShared<<<nb, 512>>>(Output_d, nTotalElements, h, Hg, SHg, 1);
         for(int i = 0; i < h; i++) {
-            if(thrustQueue[i] > SHARED_SIZE_LIMIT)
+            if(thrustQueue[i] > SHM_LIMIT)
                 thrust::sort(thrust::device, Output_d, Output_d + thrustQueue[i]);
         }
         cudaEventRecord(k5_stop);
-        if (err != cudaSuccess) {
-            printf("Kernel failed: %s (bitonicSortShared)\n", cudaGetErrorString(err));
-            return 1;
-        }
+        #ifdef DEBUG
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                printf("Kernel failed: %s (bitonicSortShared)\n",
+                        cudaGetErrorString(err));
+                return 1;
+            }
+        #else
+            cudaEventSynchronize(k5_stop);
+        #endif
 
         cudaEventElapsedTime(&k1_temp, k1_start, k1_stop);
         cudaEventElapsedTime(&k2_temp, k2_start, k2_stop);
@@ -454,12 +478,12 @@ int main(int argc, char *argv[]) {
 
 
     printf("======== Kernel Timing (Average over %d runs) ========\n", nReps);
-    printf("Kernel 1 (blockAndGlobalHistogram): %.3f s\n", k1_time);
-    printf("Kernel 2 (globalHistogramScan):     %.3f s\n", k2_time);
-    printf("Kernel 3 (verticalScanHH):          %.3f s\n", k3_time);
-    printf("Kernel 4 (partitionKernel):         %.3f s\n", k4_time);
-    printf("Kernel 5 (bitonicSort + merge):    %.3f s\n", k5_time);
-    printf("Total mppSort time:                 %.3f s\n\n", total_time);
+    printf("Kernel 1 (blockAndGlobalHistogram): %.3f ms\n", k1_time);
+    printf("Kernel 2 (globalHistogramScan):     %.3f ms\n", k2_time);
+    printf("Kernel 3 (verticalScanHH):          %.3f ms\n", k3_time);
+    printf("Kernel 4 (partitionKernel):         %.3f ms\n", k4_time);
+    printf("Kernel 5 (bitonicSort + merge):     %.3f ms\n", k5_time);
+    printf("Total mppSort time:                 %.3f ms\n\n", total_time);
 
     float mppSort_throughput = (nTotalElements / 1e6) / (total_time / 1000.0f);
     printf("======== Performance Metrics ========\n");
@@ -475,7 +499,7 @@ int main(int argc, char *argv[]) {
     printf("Thrust Throughput:  %.3f GElements/s\n", thrust_throughput / 1000.0f);
 
     float speedup = thrust_total / total_time;
-    printf("\nSpeedup (mppSort vs Thrust): %.2fx n", fabs(speedup));
+    printf("\nSpeedup (mppSort vs Thrust): %.2fx \n", fabs(speedup));
 
 
     free(Input);
@@ -489,16 +513,19 @@ int main(int argc, char *argv[]) {
 
     cudaEventDestroy(k1_start);
     cudaEventDestroy(k1_stop);
+
     cudaEventDestroy(k2_start);
     cudaEventDestroy(k2_stop);
+
     cudaEventDestroy(k3_start);
     cudaEventDestroy(k3_stop);
+
     cudaEventDestroy(k4_start);
     cudaEventDestroy(k4_stop);
+
     cudaEventDestroy(k5_start);
     cudaEventDestroy(k5_stop);
-    cudaEventDestroy(total_start);
-    cudaEventDestroy(total_stop);
+
     cudaEventDestroy(thrust_start);
     cudaEventDestroy(thrust_stop);
 

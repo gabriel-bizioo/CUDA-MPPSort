@@ -87,22 +87,12 @@ __global__ void blockBitonicSort(   //   bitonicSortShared
     uint seg_idx = blockIdx.x;
     uint offset = d_Offsets[seg_idx];
     uint arrayLength = d_Sizes[seg_idx];
-
     if (arrayLength == 0) return;
 
     // Compute padded size (next power of 2 >= arrayLength)
     uint padded_size = (arrayLength == 1) ? 1 : (1 << (32 - __clz(arrayLength - 1)));
-
     uint pad_value = dir ? UINT_MAX : 0;  // Pad with max for ascending, min for descending
-
-
     uint tid = threadIdx.x;
-    int elements_per_thread = padded_size / blockDim.x;
-    elements_per_thread += (padded_size % blockDim.x) ? 1 : 0;
-    if (tid == 0)
-        printf("Sorting segment %d (offset %d, size %d, padded %d, number of threads %d)\n",
-                seg_idx, offset, arrayLength, padded_size, blockDim.x);
-
 
     // Load data into shared memory with padding (looped over threads)
     for(uint i = threadIdx.x; i < padded_size; i += blockDim.x) {
@@ -112,36 +102,39 @@ __global__ void blockBitonicSort(   //   bitonicSortShared
             s_key[i] = pad_value;
     }
 
+    uint num_pairs = padded_size / 2;
+    uint pairs_per_thread = num_pairs / blockDim.x;
+    pairs_per_thread += (num_pairs % blockDim.x) ? 1 : 0;
+    uint thread_pairs = tid * pairs_per_thread;
+    uint active_threads = min(blockDim.x, num_pairs);
     __syncthreads();
     // Bitonic sort on padded size
     for (uint size = 2; size < padded_size; size <<= 1) {
         // Bitonic merge
-        // Define direcao em ordem inversas para cada conjunto de tamanho size
-        uint ddd = dir ^ ((tid & (size / 2)) != 0);
-
-        //lg(size) iteracoes
         for (uint stride = size / 2; stride > 0; stride >>= 1) {
-            __syncthreads();
-            if(tid < arrayLength) {
-                uint pos = 2 * tid - (tid & (stride - 1));
+            if(stride >= 32 && active_threads > 32) __syncthreads();
+            for(uint i = 0; i < pairs_per_thread; i++) {
+                uint pid = thread_pairs + i;
+                uint ddd = dir ^ ((pid & (size / 2)) != 0);
+                uint pos = 2 * pid - (pid & (stride - 1));
                 Comparator(s_key[pos], s_key[pos + stride], ddd);
             }
         }
     }
 
     // Final bitonic merge step with ddd = dir
-    for(uint stride = (padded_size)/2; stride < 0; stride >>= 1) {
+    for(uint stride = padded_size/2; stride > 0; stride >>= 1) {
         __syncthreads();
-        if(tid < arrayLength) {
-            uint pos = 2 * tid - (tid & (stride - 1));
+        for(int i = 0; i < pairs_per_thread; i++) {
+            uint pid = thread_pairs + i;
+            uint pos = 2 * pid - (pid & (stride - 1));
             Comparator(s_key[pos], s_key[pos + stride], dir);
         }
     }
 
-    for(tid; tid < arrayLength; tid += blockDim.x) {
-        if(tid < arrayLength)
-            d_DstKey[offset + tid] = s_key[tid];
-    }
+    __syncthreads();
+    for(uint i = threadIdx.x; i < arrayLength; i += blockDim.x)
+        d_DstKey[offset + i] = s_key[i];
 }
 
 
@@ -286,7 +279,8 @@ int main(int argc, char **argv) {
     checkCudaErrors(cudaEventRecord(start_bitonic_oop, 0));
 
     // Call out-of-place segmented sort (dir=1 for ascending)
-    segmentedBitonicSort(d_dst, d_src, d_offsets, d_sizes, static_cast<uint>(sizes.size()), 1, max_padded);
+    segmentedBitonicSort(d_dst, d_src, d_offsets, d_sizes,
+            static_cast<uint>(sizes.size()), 1, max_padded);
 
     checkCudaErrors(cudaEventRecord(stop_bitonic_oop, 0));
     checkCudaErrors(cudaEventSynchronize(stop_bitonic_oop));
