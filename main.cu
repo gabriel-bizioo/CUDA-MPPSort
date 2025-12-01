@@ -75,25 +75,36 @@ blockAndGlobalHistogram(unsigned int *HH, unsigned int *Hg, int h, unsigned int 
 }
 
 __global__ void
-globalHistogramScan(unsigned int *Hg, unsigned int *SHg, int h) {
-    // sizeof(unsigned int) * (h + 1)
+globalHistogramScan(const unsigned int *Hg, unsigned int *SHg, int h)
+{
     extern __shared__ unsigned int scan[];
 
-    if(threadIdx.x == 0)
-        scan[0] = 0;
-    if(threadIdx.x < h)
-        scan[threadIdx.x + 1] = Hg[threadIdx.x];
+    int tid = threadIdx.x;
+
+    // Load
+    if (tid < h)
+        scan[tid] = Hg[tid];
+    else
+        scan[tid] = 0;
+
     __syncthreads();
 
-    for(int i = 1; i <= h; i += i) {
-        if(threadIdx.x <= h && threadIdx.x >= i)
-            scan[threadIdx.x] += scan[threadIdx.x - i];
+    for (int offset = 1; offset < h; offset <<= 1) {
+        unsigned int val = 0;
+        if (tid >= offset)
+            val = scan[tid - offset];
+        __syncthreads();
+        scan[tid] += val;
         __syncthreads();
     }
 
-    if(threadIdx.x <= h)
-        SHg[threadIdx.x] = scan[threadIdx.x];
+    if (tid == 0)
+        SHg[0] = 0;
+
+    if (tid < h)
+        SHg[tid] = (tid == 0 ? 0 : scan[tid - 1]);
 }
+
 
 __global__ void
 verticalScanHH(unsigned int *HH, unsigned int *PSv, int h) {
@@ -114,7 +125,6 @@ __global__ void
 partitionKernel(unsigned int *SHg, unsigned int *PSv, int h, unsigned int *Input,
                 unsigned int *Output, int nElements, unsigned int minV, unsigned int maxV) {
     extern __shared__ unsigned int HLsh[];
-    uint seg_idx = blockIdx.x;
     uint tid = threadIdx.x;
 
     for(int i = tid; i < h; i += blockDim.x)
@@ -167,7 +177,9 @@ __global__ void blockBitonicSort(
     uint offset = d_Offsets[seg_idx];
     uint arrayLength = d_Sizes[seg_idx];
     if (arrayLength == 0) return;
-    if(arrayLength > SHM_LIMIT) return;
+    if(arrayLength > SHM_LIMIT) {
+        if(threadIdx.x == 0) printf("Not enough shared memory\n"); return;
+    }
 
     // Compute padded size (next power of 2 >= arrayLength)
     uint padded_size = (arrayLength == 1) ? 1 : (1 << (32 - __clz(arrayLength - 1)));
@@ -393,17 +405,40 @@ int main(int argc, char *argv[]) {
             std::vector<unsigned int> HH_host(nb * h);
             std::vector<unsigned int> PSv_host(nb * h);
             std::vector<unsigned int> PSv_ref(nb * h);   // CPU result
+            std::vector<unsigned int> SHg_ref(h+1);
+            std::vector<unsigned int> SHg_host(h+1);
+            std::vector<unsigned int> Hg_host(h);
 
             cudaMemcpy(HH_host.data(), HH,
                     nb * h * sizeof(unsigned int),
                     cudaMemcpyDeviceToHost);
-
             cudaMemcpy(PSv_host.data(), PSv,
                     nb * h * sizeof(unsigned int),
                     cudaMemcpyDeviceToHost);
+            cudaMemcpy(Hg_host.data(), Hg,
+                    h * sizeof(unsigned int),
+                    cudaMemcpyDeviceToHost);
+            cudaMemcpy(SHg_host.data(), SHg,
+                    (h + 1) * sizeof(unsigned int),
+                    cudaMemcpyDeviceToHost);
+
+            SHg_ref[0] = 0;
+            for (int j = 0; j < h; ++j) {
+                SHg_ref[j+1] = SHg_ref[j] + Hg_host[j];
+            }
+            bool ok = true;
+            for (int j = 0; j <= h; ++j) {
+                if (SHg_host[j] != SHg_ref[j]) {
+                    printf("SHg mismatch in j=%d: GPU=%u CPU=%u\n",
+                            j, SHg_host[j], SHg_ref[j]);
+                    ok = false;
+                    break;
+                }
+            }
+            printf("SHg check: %s\n", ok ? "OK" : "FAIL");
 
             buildPSvCPU(HH_host.data(), PSv_ref.data(), nb, h);
-            bool ok = true;
+            ok = true;
             for (int b = 0; b < nb; ++b) {
                 for (int j = 0; j < h; ++j) {
                     unsigned int gpu = PSv_host[b*h + j];
@@ -444,22 +479,24 @@ int main(int argc, char *argv[]) {
             if(h_Hg[i] > max)
                 max = h_Hg[i];
             uint padded = (max == 0) ? 0 : (max == 1) ? 1 : (1u << (32 - __builtin_clz(max - 1)));
-            if(padded < SHM_LIMIT)
+            if(padded <= SHM_LIMIT)
                 shared_bytes = padded;
         }
         shared_bytes *= sizeof(uint);
         blockBitonicSort<<<h, THREADS_PER_BLOCK, shared_bytes>>>(Output_d, Output_d,
                 SHg, Hg, 1);
-        for(int i = 0; i < h; i++) {
-            if(h_Hg[i] > SHM_LIMIT)
-                thrust::sort(thrust::device, Output_d + SHg[i],
-                    Output_d + SHg[i] + Hg[i]);
-        }
+        // for(int i = 0; i < h; i++) {
+        //     if(h_Hg[i] > SHM_LIMIT) {
+        //         printf("Perdendo para o thrust\n");
+        //         thrust::sort(thrust::device, Output_d + SHg[i],
+        //                 Output_d + SHg[i] + Hg[i]);
+        //     }
+        // }
         cudaEventRecord(k5_stop);
         #ifdef DEBUG
             err = cudaDeviceSynchronize();
             if (err != cudaSuccess) {
-                printf("Kernel failed: %s (bitonicSortShared)\n",
+                printf("Kernel failed: %s (blockBitonicSort)\n",
                         cudaGetErrorString(err));
                 return 1;
             }
