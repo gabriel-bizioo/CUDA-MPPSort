@@ -123,7 +123,7 @@ __global__ void blockBitonicSort(   //   bitonicSortShared
     }
 
     // Final bitonic merge step with ddd = dir
-    for(uint stride = padded_size/2; stride > 0; stride >>= 1) {
+    for(uint stride = padded_size / 2; stride > 0; stride >>= 1) {
         __syncthreads();
         for(int i = 0; i < pairs_per_thread; i++) {
             uint pid = thread_pairs + i;

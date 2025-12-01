@@ -12,8 +12,10 @@
 #include <thrust/device_ptr.h>
 
 #define MAX_SIZE INT_MAX
-#define SHM_LIMIT 4096
+#define SHM_LIMIT 8192U
+#define DEBUG
 
+typedef unsigned int uint;
 
 inline void checkCuda(cudaError_t result, const char debugstr[256]) {
     if(result != cudaSuccess) {
@@ -76,7 +78,7 @@ __global__ void
 globalHistogramScan(unsigned int *Hg, unsigned int *SHg, int h) {
     // sizeof(unsigned int) * (h + 1)
     extern __shared__ unsigned int scan[];
- 
+
     if(threadIdx.x == 0)
         scan[0] = 0;
     if(threadIdx.x < h)
@@ -89,12 +91,11 @@ globalHistogramScan(unsigned int *Hg, unsigned int *SHg, int h) {
         __syncthreads();
     }
 
-    if(threadIdx.x < h) {
+    if(threadIdx.x <= h)
         SHg[threadIdx.x] = scan[threadIdx.x];
-    }
 }
 
-__global__ void 
+__global__ void
 verticalScanHH(unsigned int *HH, unsigned int *PSv, int h) {
     if (threadIdx.x < h) {
         unsigned int index = blockIdx.x * h + threadIdx.x;
@@ -113,9 +114,11 @@ __global__ void
 partitionKernel(unsigned int *SHg, unsigned int *PSv, int h, unsigned int *Input,
                 unsigned int *Output, int nElements, unsigned int minV, unsigned int maxV) {
     extern __shared__ unsigned int HLsh[];
+    uint seg_idx = blockIdx.x;
+    uint tid = threadIdx.x;
 
-    if(threadIdx.x < h)
-        HLsh[threadIdx.x] = PSv[blockIdx.x * h + threadIdx.x] + SHg[threadIdx.x];
+    for(int i = tid; i < h; i += blockDim.x)
+        HLsh[i] = PSv[blockIdx.x * h + i] + SHg[i];
     __syncthreads();
 
     unsigned int partition_size = (maxV - minV + 1) / h;
@@ -164,6 +167,7 @@ __global__ void blockBitonicSort(
     uint offset = d_Offsets[seg_idx];
     uint arrayLength = d_Sizes[seg_idx];
     if (arrayLength == 0) return;
+    if(arrayLength > SHM_LIMIT) return;
 
     // Compute padded size (next power of 2 >= arrayLength)
     uint padded_size = (arrayLength == 1) ? 1 : (1 << (32 - __clz(arrayLength - 1)));
@@ -177,9 +181,11 @@ __global__ void blockBitonicSort(
             s_key[i] = pad_value;
     }
 
-    uint pairs_per_thread = (padded_size / 2) / blockDim.x;
-    pairs_per_thread += ((padded_size / 2) % blockDim.x) ? 1 : 0;
+    uint num_pairs = padded_size / 2;
+    uint pairs_per_thread = num_pairs / blockDim.x;
+    pairs_per_thread += num_pairs % blockDim.x ? 1 : 0;
     uint thread_pairs = tid * pairs_per_thread;
+    uint active_threads = min(blockDim.x, num_pairs);
     __syncthreads();
     // Bitonic sort on padded size
     for (uint size = 2; size < padded_size; size <<= 1) {
@@ -196,7 +202,7 @@ __global__ void blockBitonicSort(
     }
 
     // ddd == dir for the last bitonic merge step
-    for (uint stride = padded_size/ 2; stride > 0; stride >>= 1) {
+    for (uint stride = padded_size / 2; stride > 0; stride >>= 1) {
         __syncthreads();
         for(uint i = 0; i < pairs_per_thread; i++) {
             uint pid = thread_pairs + i;
@@ -265,12 +271,8 @@ int main(int argc, char *argv[]) {
     srand(42);
     for(unsigned int i = 0; i < nTotalElements; i++) {
         int a = rand();
-        #ifdef DEBUG
-            unsigned int v = a % (101);
-        #else
             int b = rand();
             unsigned int v = a * 100 + b;
-        #endif
 
         if(v < minV) minV = v;
         if(v > maxV) maxV = v;
@@ -285,6 +287,7 @@ int main(int argc, char *argv[]) {
 
     unsigned int *Input_d, *Output_d;
     unsigned int *HH, *Hg, *SHg, *PSv;
+    unsigned int *h_Hg = (uint*)malloc(h * sizeof(uint));
 
     int nb;
     if(h >= 16)
@@ -334,7 +337,6 @@ int main(int argc, char *argv[]) {
     blockAndGlobalHistogram<<<nb, nt, sizeof(unsigned int) * h>>>(HH, Hg, h, Input_d,
             nTotalElements, minV, maxV);
     cudaDeviceSynchronize();
-    unsigned int thrustQueue[h];
 
     float k1_time, k2_time, k3_time, k4_time, k5_time, total_time;
     k1_time = k2_time = k3_time = k4_time = k5_time = 0.0f;
@@ -388,6 +390,38 @@ int main(int argc, char *argv[]) {
             cudaEventSynchronize(k3_stop);
         #endif
 
+            std::vector<unsigned int> HH_host(nb * h);
+            std::vector<unsigned int> PSv_host(nb * h);
+            std::vector<unsigned int> PSv_ref(nb * h);   // CPU result
+
+            cudaMemcpy(HH_host.data(), HH,
+                    nb * h * sizeof(unsigned int),
+                    cudaMemcpyDeviceToHost);
+
+            cudaMemcpy(PSv_host.data(), PSv,
+                    nb * h * sizeof(unsigned int),
+                    cudaMemcpyDeviceToHost);
+
+            buildPSvCPU(HH_host.data(), PSv_ref.data(), nb, h);
+            bool ok = true;
+            for (int b = 0; b < nb; ++b) {
+                for (int j = 0; j < h; ++j) {
+                    unsigned int gpu = PSv_host[b*h + j];
+                    unsigned int cpu = PSv_ref[b*h + j];
+
+                    if (gpu != cpu) {
+                        printf("Mismatch at block %d, bucket %d: GPU=%u CPU=%u\n",
+                                b, j, gpu, cpu);
+                        ok = false;
+                        goto done;
+                    }
+                }
+            }
+
+            done:
+            printf("PSv check: %s\n", ok ? "OK" : "ERROR");
+
+
         cudaEventRecord(k4_start);
         partitionKernel<<<nb, 1024, sizeof(unsigned int) * h>>>(SHg, PSv, h, Input_d, Output_d, nTotalElements, minV, maxV);
         cudaEventRecord(k4_stop);
@@ -403,12 +437,23 @@ int main(int argc, char *argv[]) {
         #endif
 
         cudaEventRecord(k5_start);
-        size_t shared_bytes = SHM_LIMIT * sizeof(uint);
-        blockBitonicSort<<<h, THREADS_PER_BLOCK, shared_bytes>>>(Output_d, Output_d, SHg, Hg, 1);
-        checkCuda(cudaMemcpy(thrustQueue, Hg, sizeof(unsigned int) * h, cudaMemcpyDeviceToHost), "Thrust queue");
+        checkCuda(cudaMemcpy(h_Hg, Hg, sizeof(uint) * h, cudaMemcpyDeviceToHost), "Thrust Queue");
+        size_t shared_bytes;
+        uint max = h_Hg[0];
+        for(int i = 1; i < h; i++) {
+            if(h_Hg[i] > max)
+                max = h_Hg[i];
+            uint padded = (max == 0) ? 0 : (max == 1) ? 1 : (1u << (32 - __builtin_clz(max - 1)));
+            if(padded < SHM_LIMIT)
+                shared_bytes = padded;
+        }
+        shared_bytes *= sizeof(uint);
+        blockBitonicSort<<<h, THREADS_PER_BLOCK, shared_bytes>>>(Output_d, Output_d,
+                SHg, Hg, 1);
         for(int i = 0; i < h; i++) {
-            if(thrustQueue[i] > SHM_LIMIT)
-                thrust::sort(thrust::device, Output_d, Output_d + thrustQueue[i]);
+            if(h_Hg[i] > SHM_LIMIT)
+                thrust::sort(thrust::device, Output_d + SHg[i],
+                    Output_d + SHg[i] + Hg[i]);
         }
         cudaEventRecord(k5_stop);
         #ifdef DEBUG
