@@ -29,31 +29,32 @@ ainda estão desordenados
 5) Percorre os segmentos de forma paralela, ordenando internamente NBLOCOS particões por passo
 
 
-## Implementação
-Infelizmente, entradas muito altas ou número de partições grandes demais geram bugs e acabam ordenando o vetor incorretamente.
-Quando partições são muito grandes e estouram o limite de memória compartilhada dos blocos, o thrust sort é chamado para ordená-los,
-adicionando um overhead significativo que faz com que a implementação perca para o algoritmo de referência.
-Os passos da ordenação ainda são realizados mesmo com um reultado incorreto e, tanto essas saídas incorretas quanto as entradas 
-menores que funcionam corretamente conseguem bater o tempo do algoritmo thrust, desde que o tamanho das partições não seja
-maior que o limite da memória compartilhada.
-Junto do trabalho está um gráfico mostrando o resultado de um teste com 10000 elementos e 16 partições, executado com 100
-repetições.
+## Implementação Do Novo Bitonic Sort
+O novo Bitonic Sort consegue ordenar vetores de tamanho arbitrário, não dependendo da
+quantidade de threads no bloco, o que é possivel ao atribuir a cada thread a
+responsabilidade por comparar um numero X de pares de elementos, com X sendo igual a
+metade do tamanho do vetor pela quantidade de threads (asssumindo que a quantidade de
+threads é menor que metade do tamanho do vetor). Para vetores que não são múltiplos
+de 2, valores de padding são adicionados na shared memory e o algoritmo roda para o
+tamanho do próximo múltiplo de 2 do vetor.
+Devido a restrições com os kernels do último trabalho, o número máximo de segmentos é
+igual ao númeor máximo de threads por bloco, i.t 1024 threads.
 
 ## Ambiente de teste
-Os teste foram feitos utilizando a máquina Orval do Dinf, que roda uma GTX 750 Ti
+Os teste foram feitos utilizando a máquina Orval do Dinf, que roda uma GTX 750 Ti, usando
+o maior numero de threads possivel na GPU para o blockBitonicSort, i.e 1024 threads
+(média de 100 repetições).
 
 
 ## Resultados
-======== Kernel Timing (Average over 100 runs) ========
-Kernel 1 (blockAndGlobalHistogram): 0.015 s
-Kernel 2 (globalHistogramScan):     0.009 s
-Kernel 3 (verticalScanHH):          0.009 s
-Kernel 4 (partitionKernel):         0.015 s
-Kernel 5 (bitonicSort + merge):    0.083 s
-Total mppSort time:                 0.131 s
 
-mppSort Throughput: 0.076 GElements/s
-Thrust sort time:   0.201 ms
-Thrust Throughput:  0.050 GElements/s
+### Tempos:
+Elementos:      1M      2M      4M      8M
+MPP (ms):       6.2     8.3     17.1    54.919
+Thrust (ms):    2.4     4.5     8.8     17.287
+Speedup:        0.39x   0.55x   0.51x   0.31x
 
-
+### Vazão:
+Elementos:               1M      2M      4M      8M
+MPP (GElements/s):       0.16    0.241   0.233   0.146
+Thrust (GElements/s):    0.406   0.437   0.454   0.463
